@@ -11,7 +11,9 @@ import {
   ESCALATION_TARGETS,
   WIDER_MODES,
   approveEscalation,
+  escalationGuidance,
   escalationHintMarker,
+  normalizeEscalationArgs,
   sandboxDenialMarker,
   validateEscalationArgs,
 } from '@deepseek-ai/dsh-sandbox'
@@ -29,9 +31,41 @@ describe('the strictly-wider ladder', () => {
   })
 })
 
+describe('normalizeEscalationArgs', () => {
+  it('returns the pair for a request that carries both fields', () => {
+    expect(normalizeEscalationArgs('workspace-write', 'because the workspace needs it'))
+      .toEqual({ sandbox_permissions: 'workspace-write', justification: 'because the workspace needs it' })
+  })
+
+  it('treats omitted and blank fields alike as no request at all', () => {
+    for (const [permission, reason] of [
+      [undefined, undefined],
+      ['', ''],
+      ['   ', '  '],
+      ['', undefined],
+      [undefined, '  '],
+    ] as const) {
+      expect(normalizeEscalationArgs(permission, reason)).toBeUndefined()
+    }
+  })
+
+  it('rejects permission without justification', () => {
+    expect(() => normalizeEscalationArgs('workspace-write', undefined)).toThrow(/requires a justification/)
+  })
+
+  it('rejects justification without permission', () => {
+    expect(() => normalizeEscalationArgs(undefined, 'orphan reason')).toThrow(/only valid together with sandbox_permissions/)
+  })
+
+  it('rejects a whitespace-only justification when a permission is present', () => {
+    expect(() => normalizeEscalationArgs('workspace-write', '   ')).toThrow(/non-empty sentence/)
+  })
+})
+
 describe('validateEscalationArgs', () => {
-  it('accepts neither field, or both with a non-empty justification', () => {
+  it('accepts neither field, a blank pair, or both with a non-empty justification', () => {
     expect(() => { validateEscalationArgs(undefined, undefined) }).not.toThrow()
+    expect(() => { validateEscalationArgs('', '') }).not.toThrow()
     expect(() => { validateEscalationArgs('workspace-write', 'because the workspace needs it') }).not.toThrow()
   })
 
@@ -39,6 +73,27 @@ describe('validateEscalationArgs', () => {
     expect(() => { validateEscalationArgs('workspace-write', undefined) }).toThrow(/requires a justification/)
     expect(() => { validateEscalationArgs(undefined, 'orphan reason') }).toThrow(/only valid together with sandbox_permissions/)
     expect(() => { validateEscalationArgs('workspace-write', '   ') }).toThrow(/non-empty sentence/)
+  })
+})
+
+describe('escalationGuidance', () => {
+  it('states the ordinary-call rule, the denial-grounded retry, and the pairing', () => {
+    const text = escalationGuidance('read-only', 'command')
+    expect(text).toContain('never part of an ordinary call')
+    expect(text).toContain('has just been denied by the sandbox')
+    expect(text).toContain('retry it once, in the same turn, verbatim')
+    expect(text).toContain('travel together')
+    expect(text).toContain('non-empty sentence')
+    expect(text).toContain('no mode may be requested for itself or for a narrower one')
+  })
+
+  it('names the reachable ladder of the composition mode, and nothing wider than full access', () => {
+    expect(escalationGuidance('read-only', 'file operation'))
+      .toContain('confines at `read-only`, so `workspace-write` and then `danger-full-access` are reachable')
+    expect(escalationGuidance('workspace-write', 'command'))
+      .toContain('confines at `workspace-write`, whose only wider mode is `danger-full-access`')
+    expect(escalationGuidance('danger-full-access', 'command'))
+      .toContain('runs at `danger-full-access`, which no mode is wider than, so a call running under it has nothing to escalate to')
   })
 })
 

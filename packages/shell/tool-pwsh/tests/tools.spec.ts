@@ -30,6 +30,7 @@ import type { ShellExecRequest, ShellExecSpec, ShellProcess, ShellRunResult } fr
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { turnBoundaryProjectionDefinition } from '@deepseek-ai/dsh-agent-loop'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
+import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import * as ToolPwsh from '@deepseek-ai/dsh-tool-pwsh'
 import * as BashEnvPlugin from '@deepseek-ai/dsh-shell-env'
 import type { ShellProcessRead } from '@deepseek-ai/dsh-shell'
@@ -172,9 +173,11 @@ async function setupWithTasks(toolConfig: Partial<ToolPwsh.Config> = {}, dshHome
 class ConfiningFakeBash extends ShellExecutor {
   requests: ShellExecRequest[] = []
   modes: Array<string | undefined> = []
+  /** Arm a denial for the next run (the policy-denial surface). */
+  denied = false
 
-  override get sandboxMode() {
-    return 'read-only' as const
+  override get sandboxMode(): SandboxMode {
+    return 'read-only'
   }
 
   override resolve(request: ShellExecRequest): ShellExecSpec {
@@ -195,7 +198,7 @@ class ConfiningFakeBash extends ShellExecutor {
     return runResult('ok\n', {
       sandbox: {
         mode: spec.sandboxPolicy?.mode ?? 'read-only',
-        denied: false,
+        denied: this.denied,
         ...spec.command === 'without optional sandbox facts'
           ? {}
           : { enforcement: 'full' as const, runnerFailed: false },
@@ -209,8 +212,16 @@ class ConfiningFakeBash extends ShellExecutor {
   }
 }
 
+/** A confining fake pinned to `mode`, read once at plugin mount (the tool derives its description from it). */
+function confiningFakeBashAt(mode: SandboxMode) {
+  return class extends ConfiningFakeBash {
+    override get sandboxMode(): SandboxMode { return mode }
+  }
+}
+
 /** Sandboxed composition: the shared policy service + a confining executor + the pwsh tool (+ optional approval). */
-async function setupSandboxed(withApproval = false) {
+async function setupSandboxed(withApproval = false, opts: { mode?: SandboxMode; approvalPolicy?: 'ask' | 'never' } = {}) {
+  const mode = opts.mode ?? 'read-only'
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
@@ -223,9 +234,9 @@ async function setupSandboxed(withApproval = false) {
   // bench — the loop itself is not composed. Register its open-turn fold so
   // the approval service's turn-enclosure gate reads the seeded log shape.
   ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
-  await ctx.plugin(SandboxPolicyService, {})
-  await ctx.plugin(ConfiningFakeBash)
-  if (withApproval) await ctx.plugin(ApprovalService)
+  await ctx.plugin(SandboxPolicyService, { mode })
+  await ctx.plugin(confiningFakeBashAt(mode))
+  if (withApproval) await ctx.plugin(ApprovalService, opts.approvalPolicy === undefined ? {} : { policy: opts.approvalPolicy })
   await ctx.plugin(ToolPwsh)
   const bash = ctx.shell as ConfiningFakeBash
   return { ctx, bash }
@@ -601,11 +612,17 @@ describe('sandbox escalation through ctx.approval', () => {
     const schema = ctx.tools.schemas().find(item => item.name === 'pwsh')!
     const properties = schema.parameters.properties as Record<string, { enum?: string[] }>
     expect(properties['sandbox_permissions']?.enum).toEqual(['workspace-write', 'danger-full-access'])
+    // The escalation fields are OPTIONAL: the schema never requires them, so an
+    // ordinary call that omits both is valid without any transport defaulting.
+    expect(schema.parameters.required).toEqual(['command', 'description'])
     expect(schema.description).toContain('approval prompt')
     expect(schema.description).toContain('ConstrainedLanguage')
     expect(schema.description).toContain('workspace-write stays in FullLanguage')
     expect(schema.description).toContain('In both confined modes, programs cannot open named pipes')
     expect(schema.description).toContain('fails with EPERM')
+    // The escalation paragraph names THIS composition's mode (read-only here).
+    expect(schema.description).toContain('never part of an ordinary call')
+    expect(schema.description).toContain('confines at `read-only`')
 
     for (const args of [
       { command: 'Write-Output ok', description: 'd', sandbox_permissions: 'workspace-write' },
@@ -614,6 +631,89 @@ describe('sandbox escalation through ctx.approval', () => {
     ]) {
       expect((await call(ctx, 'pwsh', args)).isError).toBe(true)
     }
+  })
+
+  it('allows pwsh without escalation fields, and refuses a blank value the advertised vocabulary excludes', async () => {
+    const { ctx, bash } = await setupSandboxed(true)
+    const prompted = vi.fn()
+    ctx.on('approval/request', () => { prompted(); return Promise.resolve<ApprovalOutcome>('allowed-once') })
+    const plain = await call(ctx, 'pwsh', { command: 'Write-Output ok', description: 'd' })
+    expect(plain.isError).toBe(false)
+    // Where the field IS advertised, its enum pins the closed target vocabulary,
+    // so a blank string is not a member and the schema refuses it before
+    // execute. Omitting both fields is the ordinary-call shape; a blank pair is
+    // only reachable (and normalized away) where the fields are unadvertised.
+    const blank = await call(ctx, 'pwsh', { command: 'Write-Output ok', description: 'd', sandbox_permissions: '', justification: '' })
+    expect(blank.isError).toBe(true)
+    expect(text(blank)).toContain('must be one of ["workspace-write","danger-full-access"]')
+    // Nothing ran and nobody was asked on either call.
+    expect(bash.modes).toEqual(['read-only'])
+    expect(prompted).not.toHaveBeenCalled()
+  })
+
+  it('treats a blank escalation pair as omitted where the fields are unadvertised', async () => {
+    const { ctx, bash } = await setup()
+    const result = await call(ctx, 'pwsh', { command: 'Write-Output ok', description: 'd', sandbox_permissions: '', justification: '   ' })
+    expect(result.isError).toBe(false)
+    expect(bash.requests).toHaveLength(1)
+  })
+
+  it('allows pwsh in danger-full-access without escalation fields, and says nothing is wider', async () => {
+    const { ctx, bash } = await setupSandboxed(true, { mode: 'danger-full-access' })
+    const schema = ctx.tools.schemas().find(item => item.name === 'pwsh')!
+    expect(schema.parameters.required).toEqual(['command', 'description'])
+    expect(schema.description).toContain('runs at `danger-full-access`')
+    expect(schema.description).toContain('nothing to escalate to')
+    const result = await call(ctx, 'pwsh', { command: 'Write-Output ok', description: 'd' })
+    expect(result.isError).toBe(false)
+    expect(bash.modes).toEqual(['danger-full-access'])
+  })
+
+  it('rejects an escalation to the mode already in force, in either composition mode', async () => {
+    const workspace = await setupSandboxed(true, { mode: 'workspace-write' })
+    workspace.ctx.on('approval/request', () => Promise.resolve<ApprovalOutcome>('allowed-once'))
+    const sameWorkspace = await call(workspace.ctx, 'pwsh', { ...escalate, sandbox_permissions: 'workspace-write' })
+    expect(text(sameWorkspace)).toContain('not strictly wider')
+    expect(workspace.bash.modes).toEqual([])
+
+    const full = await setupSandboxed(true, { mode: 'danger-full-access' })
+    full.ctx.on('approval/request', () => Promise.resolve<ApprovalOutcome>('allowed-once'))
+    const sameFull = await call(full.ctx, 'pwsh', { ...escalate, sandbox_permissions: 'danger-full-access' })
+    expect(text(sameFull)).toContain('not strictly wider')
+    expect(full.bash.modes).toEqual([])
+  })
+
+  it('allows the read-only to workspace-write retry after a denial', async () => {
+    const { ctx, bash } = await setupSandboxed(true)
+    ctx.on('approval/request', () => Promise.resolve<ApprovalOutcome>('allowed-once'))
+    const result = await call(ctx, 'pwsh', {
+      command: 'Write-Output ok',
+      description: 'retry the denied command',
+      sandbox_permissions: 'workspace-write',
+      justification: 'the sandbox just denied this command writes',
+    }, sandboxAgent())
+    expect(result.isError).toBe(false)
+    expect(bash.modes).toEqual(['workspace-write'])
+  })
+
+  it('an approval policy of never runs ordinary calls, never escalates a denial, and refuses an explicit request', async () => {
+    const { ctx, bash } = await setupSandboxed(true, { approvalPolicy: 'never' })
+    // An ordinary call carries no escalation fields and still executes.
+    const plain = await call(ctx, 'pwsh', { command: 'Write-Output ok', description: 'd' })
+    expect(plain.isError).toBe(false)
+    expect(bash.modes).toEqual(['read-only'])
+
+    // A denial under `never` is final: the tool retries nothing on its own.
+    bash.denied = true
+    const denied = await call(ctx, 'pwsh', { command: 'Write-Output ok', description: 'd' })
+    expect(text(denied)).toContain('[sandbox: file access denied under read-only mode]')
+    expect(bash.modes).toEqual(['read-only', 'read-only'])
+
+    // An explicit request stays fail-closed: `never` rejects it, nothing runs.
+    bash.denied = false
+    const explicit = await call(ctx, 'pwsh', escalate, sandboxAgent())
+    expect(text(explicit)).toContain('the user rejected escalating this command to "workspace-write"')
+    expect(bash.modes).toEqual(['read-only', 'read-only'])
   })
 
   it('the escalation fields and the confined-mode clauses stay out of sandbox-less compositions', async () => {

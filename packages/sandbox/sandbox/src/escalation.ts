@@ -41,23 +41,87 @@ export const WIDER_MODES: Record<string, readonly SandboxMode[]> = {
 export const ESCALATION_TARGETS: readonly SandboxMode[] = ['workspace-write', 'danger-full-access']
 
 /**
- * Validate the escalation argument pairing a tool schema cannot express:
- * `sandbox_permissions` and `justification` travel together — an approval
- * prompt without a reason, or a reason driving nothing, is a malformed ask —
- * and the justification must be a non-empty sentence.
+ * A normalized escalation request: both fields present with text, or the ask
+ * is not an ask at all (the normalizer returns `undefined`).
+ */
+export interface NormalizedEscalationArgs {
+  /** The requested target mode (the schema enum pins the closed target vocabulary). */
+  sandbox_permissions: string
+  /** The caller's non-empty one-sentence reason. */
+  justification: string
+}
+
+/**
+ * Normalize one raw escalation argument pair and validate the pairing a tool
+ * schema cannot express: a field that is absent OR blank counts as absent, so a
+ * transport that serializes "no escalation" as two empty strings reads exactly
+ * like a caller that omitted both — an ordinary call is never turned into a
+ * malformed ask by the caller's own empty-string defaults. A request that
+ * survives normalization must be whole: `sandbox_permissions` and
+ * `justification` travel together — an approval prompt without a reason, or a
+ * reason driving nothing, is a malformed ask — and the justification must be a
+ * non-empty sentence. Nothing here invents a request, widens a mode, or drops a
+ * real one: normalization can only empty a field the caller left blank.
+ * @param sandboxPermissions - the raw `sandbox_permissions` argument, if given.
+ * @param justification - the raw `justification` argument, if given.
+ * @returns the normalized pair, or `undefined` when neither field carries text.
+ */
+export function normalizeEscalationArgs(
+  sandboxPermissions: string | undefined,
+  justification: string | undefined,
+): NormalizedEscalationArgs | undefined {
+  const permission = sandboxPermissions !== undefined && sandboxPermissions.trim().length > 0 ? sandboxPermissions : undefined
+  const reason = justification !== undefined && justification.trim().length > 0 ? justification : undefined
+  if (reason !== undefined && permission === undefined) {
+    throw new Error('invalid escalation: justification is only valid together with sandbox_permissions')
+  }
+  if (permission !== undefined) {
+    if (justification === undefined) {
+      throw new Error('invalid escalation: sandbox_permissions requires a justification')
+    }
+    if (reason === undefined) {
+      throw new Error('invalid justification: expected a non-empty sentence')
+    }
+    return { sandbox_permissions: permission, justification: reason }
+  }
+  return undefined
+}
+
+/**
+ * Validate the escalation argument pairing a tool schema cannot express; the
+ * voider face of {@link normalizeEscalationArgs} for callers that only judge
+ * the pair and do not consume the normalized values.
  * @param sandboxPermissions - the raw `sandbox_permissions` argument, if given.
  * @param justification - the raw `justification` argument, if given.
  */
 export function validateEscalationArgs(sandboxPermissions: string | undefined, justification: string | undefined): void {
-  if (sandboxPermissions !== undefined && justification === undefined) {
-    throw new Error('invalid escalation: sandbox_permissions requires a justification')
-  }
-  if (justification !== undefined && sandboxPermissions === undefined) {
-    throw new Error('invalid escalation: justification is only valid together with sandbox_permissions')
-  }
-  if (justification !== undefined && justification.trim().length === 0) {
-    throw new Error('invalid justification: expected a non-empty sentence')
-  }
+  normalizeEscalationArgs(sandboxPermissions, justification)
+}
+
+/**
+ * The mode-aware escalation paragraph an advertising tool appends to its
+ * model-facing description: the standing rule (escalation is never part of an
+ * ordinary call; only an action the sandbox has just denied may retry once with
+ * the fields) plus what THIS composition's mode leaves reachable. The mode
+ * passed in is the composition's own sandbox mode, not the call's effective
+ * one — the ladder itself is checked per call at execution, so a session
+ * switched narrower still escalates against the mode in force then.
+ * @param mode - the composition's sandbox mode.
+ * @param subject - the family's noun for the escalating action (`command` for a
+ *   shell command, `file operation` for a filesystem mutation).
+ * @returns the paragraph, with its leading space, ready to concatenate.
+ */
+export function escalationGuidance(mode: SandboxMode, subject: string): string {
+  const ladder = mode === 'read-only'
+    ? 'This composition confines at `read-only`, so `workspace-write` and then `danger-full-access` are reachable — request the narrowest one that suffices.'
+    : mode === 'workspace-write'
+      ? 'This composition confines at `workspace-write`, whose only wider mode is `danger-full-access`.'
+      : 'This composition runs at `danger-full-access`, which no mode is wider than, so a call running under it has nothing to escalate to.'
+  return ' Escalation is never part of an ordinary call: do not pass `sandbox_permissions` or `justification` unless this exact '
+    + `${subject} has just been denied by the sandbox, and then only to retry it once, in the same turn, verbatim. `
+    + 'The two fields travel together, `justification` must be a non-empty sentence, and no mode may be requested for itself or '
+    + 'for a narrower one — the ladder is checked against the mode in force when the call runs. '
+    + ladder
 }
 
 /**
